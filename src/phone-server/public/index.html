@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Claude Eyes — Phone Camera</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #0a0a0a;
+      color: #fff;
+      font-family: -apple-system, sans-serif;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      min-height: 100vh;
+      padding: 24px 16px;
+      gap: 16px;
+    }
+    h1 { font-size: 20px; font-weight: 600; letter-spacing: -0.3px; }
+    p { font-size: 13px; color: #888; text-align: center; }
+    video {
+      width: 100%;
+      max-width: 400px;
+      border-radius: 12px;
+      background: #111;
+    }
+    canvas { display: none; }
+    .status {
+      font-size: 13px;
+      padding: 8px 16px;
+      border-radius: 20px;
+      background: #1a1a1a;
+      color: #888;
+    }
+    .status.ok { background: #0f2e1a; color: #4ade80; }
+    .status.error { background: #2e0f0f; color: #f87171; }
+    button {
+      padding: 12px 28px;
+      border-radius: 24px;
+      border: none;
+      background: #d4af37;
+      color: #000;
+      font-size: 15px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    button:disabled { opacity: 0.4; cursor: not-allowed; }
+    select {
+      padding: 8px 12px;
+      border-radius: 8px;
+      border: 1px solid #333;
+      background: #1a1a1a;
+      color: #fff;
+      font-size: 14px;
+    }
+  </style>
+</head>
+<body>
+  <h1>Claude Eyes</h1>
+  <p>Point your phone camera at anything.<br/>Claude will see it when you ask.</p>
+
+  <select id="cameraSelect"></select>
+  <video id="video" autoplay playsinline muted></video>
+  <canvas id="canvas"></canvas>
+
+  <div class="status" id="status">Starting camera...</div>
+  <button id="snapBtn" disabled>Send Frame to Claude</button>
+  <button id="photoBtn" style="display:none">📷 Take photo &amp; send</button>
+  <input type="file" id="fileInput" accept="image/*" capture="environment" hidden />
+
+  <script>
+    const video = document.getElementById('video');
+    const canvas = document.getElementById('canvas');
+    const status = document.getElementById('status');
+    const snapBtn = document.getElementById('snapBtn');
+    const photoBtn = document.getElementById('photoBtn');
+    const fileInput = document.getElementById('fileInput');
+    const cameraSelect = document.getElementById('cameraSelect');
+
+    let stream = null;
+
+    // Fallback path: the native camera via <input capture>. Works even
+    // without a secure context or when getUserMedia is denied.
+    function showFallback(message) {
+      status.textContent = message;
+      status.className = 'status error';
+      video.style.display = 'none';
+      cameraSelect.style.display = 'none';
+      snapBtn.style.display = 'none';
+      photoBtn.style.display = '';
+    }
+
+    photoBtn.addEventListener('click', () => fileInput.click());
+
+    fileInput.addEventListener('change', async () => {
+      const file = fileInput.files[0];
+      if (!file) return;
+      status.textContent = 'Sending...';
+      status.className = 'status';
+      try {
+        const form = new FormData();
+        form.append('frame', file, 'frame.jpg');
+        const res = await fetch('/frame', { method: 'POST', body: form });
+        if (!res.ok) throw new Error('Upload failed');
+        status.textContent = 'Photo sent — Claude can see it now';
+        status.className = 'status ok';
+      } catch {
+        status.textContent = 'Failed to send photo';
+        status.className = 'status error';
+      }
+      fileInput.value = '';
+    });
+
+    async function populateCameras() {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const cameras = devices.filter(d => d.kind === 'videoinput');
+      cameraSelect.innerHTML = cameras.map((c, i) =>
+        `<option value="${c.deviceId}">${c.label || 'Camera ' + (i + 1)}</option>`
+      ).join('');
+      // Reflect the active track's camera if we can find it
+      const activeLabel = stream?.getVideoTracks()[0]?.label;
+      const active = cameras.find(c => c.label && c.label === activeLabel);
+      if (active) cameraSelect.value = active.deviceId;
+    }
+
+    async function startCamera(deviceId) {
+      if (stream) stream.getTracks().forEach(t => t.stop());
+      const constraints = {
+        video: deviceId
+          ? { deviceId: { exact: deviceId } }
+          : { facingMode: { ideal: 'environment' } }
+      };
+      stream = await navigator.mediaDevices.getUserMedia(constraints);
+      video.srcObject = stream;
+      status.textContent = 'Camera ready';
+      status.className = 'status ok';
+      snapBtn.disabled = false;
+    }
+
+    cameraSelect.addEventListener('change', () => startCamera(cameraSelect.value));
+
+    async function init() {
+      if (!window.isSecureContext) {
+        showFallback('Live camera needs HTTPS — use the photo button below instead');
+        return;
+      }
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        showFallback('This browser has no camera API — use the photo button below instead');
+        return;
+      }
+      try {
+        // Permission prompt happens here; device labels are only readable
+        // after permission is granted, so enumerate afterwards.
+        await startCamera();
+        await populateCameras();
+      } catch (e) {
+        showFallback('Camera access denied — use the photo button below, or re-allow camera in browser settings');
+      }
+    }
+
+    snapBtn.addEventListener('click', async () => {
+      snapBtn.disabled = true;
+      status.textContent = 'Sending...';
+      status.className = 'status';
+
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      canvas.getContext('2d').drawImage(video, 0, 0);
+
+      canvas.toBlob(async (blob) => {
+        try {
+          const form = new FormData();
+          form.append('frame', blob, 'frame.jpg');
+          const res = await fetch('/frame', { method: 'POST', body: form });
+          if (res.ok) {
+            status.textContent = 'Frame sent — Claude can see it now';
+            status.className = 'status ok';
+          } else {
+            throw new Error('Upload failed');
+          }
+        } catch {
+          status.textContent = 'Failed to send frame';
+          status.className = 'status error';
+        }
+        snapBtn.disabled = false;
+      }, 'image/jpeg', 0.9);
+    });
+
+    // Auto-send every 10 seconds when page is visible
+    setInterval(() => {
+      if (!document.hidden && !snapBtn.disabled) snapBtn.click();
+    }, 10000);
+
+    init();
+  </script>
+</body>
+</html>
